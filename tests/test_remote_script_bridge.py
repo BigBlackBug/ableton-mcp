@@ -7,7 +7,9 @@ Each test pins a defect this change fixes:
 * each recv() chunk was decoded on its own, so a multi-byte UTF-8 character
   split across a chunk boundary desynchronised the connection,
 * an incomplete command grew the buffer without bound,
-* get_browser_tree never recursed and never reported a folder count.
+* get_browser_tree never recursed and never reported a folder count,
+* disconnect() left client sockets open, so after Live swapped documents the
+  MCP server kept talking to the dead instance and its stale Song.
 
 The script normally runs inside Live's interpreter, so ``_Framework`` is
 stubbed and the class is instantiated without ``__init__`` (which would open a
@@ -16,7 +18,9 @@ socket). No Ableton, no network.
 
 import importlib.util
 import json
+import socket
 import sys
+import threading
 import types
 from pathlib import Path
 
@@ -70,6 +74,7 @@ def make_instance(script_module, application=None):
     inst.application = lambda: application
     inst.log_message = lambda *a, **k: None
     inst.show_message = lambda *a, **k: None
+    inst.client_sockets = []
     return inst
 
 
@@ -234,3 +239,88 @@ def test_browser_tree_caps_a_huge_folder_and_flags_it(script_module):
 
     assert len(category["children"]) == 64
     assert category["has_more"] is True
+
+
+# ------------------------------------------------------------------ disconnect
+
+def _disconnectable(script_module, monkeypatch):
+    """An instance whose disconnect() runs without Live or a listening server."""
+    monkeypatch.setattr(script_module.ControlSurface, "disconnect",
+                        lambda self: None, raising=False)
+    inst = make_instance(script_module)
+    inst.running = True
+    inst.server = None
+    inst.server_thread = None
+    inst.client_threads = []
+    inst._teardown_passive_listeners = lambda: None
+    return inst
+
+
+def test_disconnect_closes_client_so_server_reconnects(script_module, monkeypatch):
+    """Regression: Live replaces the control surface when the user opens
+    another set. The old instance left its client socket open, its handler
+    stayed blocked in recv(), and the MCP server's liveness check kept that
+    socket, so every later command ran against the closed set's Song
+    ("did not match C++ signature: None(TPyHandle<ASong>)") until Live was
+    restarted. Closing the socket gives the server an EOF to reconnect on.
+    """
+    inst = _disconnectable(script_module, monkeypatch)
+    processed = []
+    inst._process_command = lambda command: processed.append(command) or {}
+
+    live_end, server_end = socket.socketpair()
+    server_end.settimeout(5.0)
+    inst.client_sockets.append(live_end)
+    handler = threading.Thread(target=inst._handle_client, args=(live_end,))
+    handler.daemon = True
+    handler.start()
+
+    inst.disconnect()
+
+    assert server_end.recv(1) == b""  # the MCP server sees EOF
+    handler.join(5.0)
+    assert not handler.is_alive()
+    assert inst.client_sockets == []
+    assert processed == []
+    server_end.close()
+
+
+def test_command_reaching_a_disconnected_instance_is_not_run(script_module):
+    """A command read after disconnect() must not touch the stale Song."""
+    inst = make_instance(script_module)
+    inst.running = True
+    processed = []
+    inst._process_command = lambda command: processed.append(command) or {}
+    payload = json.dumps({"type": "get_session_info", "params": {}}).encode("utf-8")
+
+    class DisconnectDuringRecv(FakeClient):
+        def recv(self, size):
+            inst.running = False
+            return super(DisconnectDuringRecv, self).recv(size)
+
+    client = DisconnectDuringRecv([payload])
+    inst._handle_client(client)
+
+    assert processed == []
+    assert client.sent == []
+    assert client.closed
+
+
+def test_socket_closed_by_disconnect_is_not_reported_as_error(script_module):
+    """disconnect() closing the socket makes recv() fail with EBADF; that is
+    the intended shutdown, not an error to log or answer."""
+    inst = make_instance(script_module)
+    inst.running = True
+    logged = []
+    inst.log_message = logged.append
+
+    class ClosedUnderneath(FakeClient):
+        def recv(self, size):
+            inst.running = False
+            raise OSError(9, "Bad file descriptor")
+
+    client = ClosedUnderneath([])
+    inst._handle_client(client)
+
+    assert client.sent == []
+    assert not any("Error handling client data" in m for m in logged)
